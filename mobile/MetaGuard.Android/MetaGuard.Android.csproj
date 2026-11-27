@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationId>com.metaguard.mediator</ApplicationId>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0.0</ApplicationDisplayVersion>
+    <ApplicationTitle>MetaGuard OS Mediator</ApplicationTitle>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\backend\MetaCore\MetaPriorityModels.cs" Link="Core\MetaPriorityModels.cs" />
+    <Compile Include="..\..\backend\MetaCore\PrivacyRiskEvaluator.cs" Link="Core\PrivacyRiskEvaluator.cs" />
+    <Compile Include="..\..\backend\MetaCore\TamperDetectionService.cs" Link="Core\TamperDetectionService.cs" />
+    <Compile Include="..\..\backend\MetaCore\OsMediationModels.cs" Link="Core\OsMediationModels.cs" />
+    <Compile Include="..\..\backend\MetaCore\MetaCoreEngine.cs" Link="Core\MetaCoreEngine.cs" />
+    <Compile Include="..\..\backend\MetaCore\MetadataExtractorService.cs" Link="Core\MetadataExtractorService.cs" />
+    <Compile Include="..\..\backend\MetaCore\NativeOpenXmlHandler.cs" Link="Core\NativeOpenXmlHandler.cs" />
+    <Compile Include="..\..\backend\MetaCore\NativePdfHandler.cs" Link="Core\NativePdfHandler.cs" />
+    <Compile Include="..\..\backend\MetaCore\NativeMp4Handler.cs" Link="Core\NativeMp4Handler.cs" />
+    <Compile Include="..\..\backend\MetaCore\NativeBinaryMetadataHandler.cs" Link="Core\NativeBinaryMetadataHandler.cs" />
+    <Compile Include="..\..\backend\MetaCore\FileSanitizerService.cs" Link="Core\FileSanitizerService.cs" />
+    <Compile Include="..\..\backend\MetaCore\OsMediationService.cs" Link="Core\OsMediationService.cs" />
+  </ItemGroup>
+
+</Project>
