@@ -15,7 +15,7 @@ public enum MetaPriority
     /// <summary>Benign technical metadata with negligible privacy risk (Kept by default).</summary>
     Low = 1,
 
-    /// <summary>Privacy- or fingerprint-sensitive metadata (Removed).</summary>
+    /// <summary>Privacy- or fingerprint-sensitive metadata (Removed or normalized).</summary>
     High = 2,
 
     /// <summary>Directly identifying, location, or high-risk PII metadata (Removed).</summary>
@@ -29,7 +29,20 @@ public enum MetaPriority
 public enum MetaAction
 {
     Keep,
-    Remove
+    Remove,
+    Normalize
+}
+
+/// <summary>
+/// Three-tier operational policy classification from the MetaGuard selective redaction algorithm.
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum MetaTierPolicy
+{
+    Tier1Purge,
+    Tier2RetainUtility,
+    Tier3Generalize,
+    RetainHarmless
 }
 
 /// <summary>
@@ -40,12 +53,13 @@ public class MetaSanitizeOptions
     public bool KeepRequired { get; set; } = true;
     public bool KeepLowPriority { get; set; } = true;
     public bool StrictMode { get; set; } = false;
+    public bool EnableTier3Normalization { get; set; } = false;
     public List<string> KeepTags { get; set; } = new();
     public List<string> RemoveTags { get; set; } = new();
 }
 
 /// <summary>
-/// A single metadata field enriched with MetaCore priority, category, and sanitization policy.
+/// A single metadata field enriched with MetaCore priority, PRI weight, tier policy, and action.
 /// </summary>
 public class ClassifiedMetadetail
 {
@@ -54,8 +68,11 @@ public class ClassifiedMetadetail
     public JsonNode? Value { get; set; }
     public MetaPriority Priority { get; set; }
     public int PriorityScore { get; set; }
+    public double BaseWeight { get; set; }
+    public MetaTierPolicy TierPolicy { get; set; }
     public string Category { get; set; } = string.Empty;
     public MetaAction Action { get; set; }
+    public string? GeneralizedValue { get; set; }
     public bool IsSensitive { get; set; }
     public bool IsRequired { get; set; }
     public bool IsEmbeddedWritable { get; set; }
@@ -64,7 +81,19 @@ public class ClassifiedMetadetail
 }
 
 /// <summary>
-/// Aggregated MetaCore priority and risk report for a file's metadata.
+/// Quas-identifier co-occurrence cluster amplifying Privacy Risk Index.
+/// </summary>
+public sealed class RiskClusterMatch
+{
+    public string ClusterId { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public double Beta { get; set; }
+    public double SynergyContribution { get; set; }
+    public List<string> InvolvedTags { get; set; } = new();
+}
+
+/// <summary>
+/// Aggregated MetaCore priority and non-linear Privacy Risk Index report for a file's metadata.
 /// </summary>
 public class MetaCoreReport
 {
@@ -76,10 +105,16 @@ public class MetaCoreReport
     public int SensitiveCount { get; set; }
     public int KeptCount { get; set; }
     public int RemovedCount { get; set; }
+    public int NormalizedCount { get; set; }
     public string RiskLevel { get; set; } = "Clean";
+    public double PrivacyRiskIndex { get; set; }
+    public string PriRiskBand { get; set; } = "Low Risk";
+    public List<RiskClusterMatch> RiskClusters { get; set; } = new();
     public List<ClassifiedMetadetail> Details { get; set; } = new();
     public List<string> KeptTags { get; set; } = new();
     public List<string> RemovedTags { get; set; } = new();
+    public List<string> NormalizedTags { get; set; } = new();
+    public Dictionary<string, string> NormalizedValues { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> WritablePreserveTags { get; set; } = new();
 }
 
@@ -97,9 +132,13 @@ public class SanitizationResult
     public string EngineUsed { get; set; } = string.Empty;
     public string DownloadId { get; set; } = string.Empty;
     public string DownloadUrl { get; set; } = string.Empty;
+    public double PrivacyExposureReductionPercent { get; set; }
     public MetaCoreReport BeforeReport { get; set; } = new();
     public MetaCoreReport AfterReport { get; set; } = new();
+    public TamperAuditReport? TamperAudit { get; set; }
+    public UsabilityPreservationMetrics? Usability { get; set; }
     public List<ClassifiedMetadetail> RemovedFields { get; set; } = new();
+    public List<ClassifiedMetadetail> GeneralizedFields { get; set; } = new();
     public List<ClassifiedMetadetail> KeptFields { get; set; } = new();
     public List<ClassifiedMetadetail> RemainingSensitiveFields { get; set; } = new();
 }

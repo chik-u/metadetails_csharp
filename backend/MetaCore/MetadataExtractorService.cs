@@ -20,7 +20,14 @@ public sealed class MetadataExtractorService
         JsonObject? metadata = null;
         string engine;
 
-        if (HasExifTool)
+        var extLower = Path.GetExtension(originalFileName).ToLowerInvariant();
+        if (NativeBinaryMetadataHandler.IsSupported(originalFileName) &&
+            extLower is ".pdf" or ".docx" or ".pptx" or ".xlsx" or ".svg" or ".wav")
+        {
+            metadata = NativeBinaryMetadataHandler.ExtractMetadata(filePath, originalFileName);
+            engine = "MetaCore Native Binary Parser";
+        }
+        else if (HasExifTool)
         {
             var output = await RunProcessAsync("exiftool", ["-j", filePath]);
             var jsonArray = JsonNode.Parse(string.IsNullOrWhiteSpace(output) ? "[]" : output) as JsonArray;

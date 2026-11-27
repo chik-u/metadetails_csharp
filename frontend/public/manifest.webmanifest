@@ -1,0 +1,54 @@
+{
+  "name": "MetaGuard & MetaDetective OS Share Mediator",
+  "short_name": "MetaGuard",
+  "description": "Priority-driven selective metadata sanitization and OS share-sheet privacy mediation.",
+  "start_url": "/share-mediate",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "share_target": {
+    "action": "/share-mediate",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [
+        {
+          "name": "files",
+          "accept": [
+            "image/*",
+            "video/*",
+            "audio/*",
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".svg",
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+            ".gif",
+            ".wav",
+            ".mp4",
+            ".mov",
+            ".pdf",
+            ".docx",
+            ".pptx"
+          ]
+        }
+      ]
+    }
+  }
+}

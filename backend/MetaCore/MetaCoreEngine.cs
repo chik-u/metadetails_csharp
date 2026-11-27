@@ -36,12 +36,13 @@ public sealed class MetaCoreEngine
         "Channels", "AudioChannels", "AudioBitsPerSample", "VideoFrameRate", "AvgBitrate",
         "Bitrate", "BitRate", "CompressorID", "CompressorName", "CodecID", "HasAlpha",
         "PixelAspectRatio", "DisplayWidth", "DisplayHeight", "ExifByteOrder", "JFIFVersion",
-        "StreamCount", "Format", "VideoCodec", "AudioCodec"
+        "StreamCount", "Format", "VideoCodec", "AudioCodec",
+        "HasStructTreeRoot", "PDFUACompliant", "MarkInfo", "OpenXMLIntegrity", "OpenXMLRelationships"
     };
 
     private static readonly HashSet<string> WritableRequiredKeys = new(StringComparer.OrdinalIgnoreCase)
     {
-        "Orientation", "ColorSpace", "XResolution", "YResolution", "ResolutionUnit",
+        "Orientation", "Rotate", "ColorSpace", "XResolution", "YResolution", "ResolutionUnit",
         "YCbCrPositioning", "ICCProfileName", "ProfileDescription", "ProfileCMMType",
         "ProfileVersion", "ProfileClass", "ColorSpaceData", "ProfileConnectionSpace",
         "RenderingIntent", "MediaWhitePoint", "RedMatrixColumn", "GreenMatrixColumn",
@@ -177,7 +178,12 @@ public sealed class MetaCoreEngine
         ["ThumbnailImage"] = new(MetaPriority.High, "Embedded Previews", "Embedded thumbnail can retain uncropped/original image data", true),
         ["PreviewImage"] = new(MetaPriority.High, "Embedded Previews", "Embedded preview can retain uncropped/original image data", true),
         ["JpgFromRaw"] = new(MetaPriority.High, "Embedded Previews", "Embedded preview JPEG from RAW", true),
-        ["PhotoshopThumbnail"] = new(MetaPriority.High, "Embedded Previews", "Embedded Photoshop preview thumbnail", true)
+        ["PhotoshopThumbnail"] = new(MetaPriority.High, "Embedded Previews", "Embedded Photoshop preview thumbnail", true),
+        ["Revision"] = new(MetaPriority.High, "Revision History", "Exposes document revision count", true),
+        ["TotalTime"] = new(MetaPriority.High, "Revision History", "Exposes cumulative editing time in minutes", true),
+        ["Template"] = new(MetaPriority.High, "Software & Toolchain", "Exposes document template filename/path", true),
+        ["GPSCoordinates"] = new(MetaPriority.Critical, "Location & GPS", "Exposes combined GPS coordinates", true),
+        ["Location"] = new(MetaPriority.Critical, "Location & GPS", "Exposes media container location tag", true)
     };
 
     private static readonly Regex CriticalPattern = new(
@@ -195,9 +201,21 @@ public sealed class MetaCoreEngine
     {
         options ??= new MetaSanitizeOptions();
         var (groupPrefix, normalizedKey) = SplitGroupPrefix(key);
+        var rawString = value?.ToString();
 
         var (priority, category, reason, isEmbeddedWritable, isRuntimeSynthetic) =
             ResolveBaseClassification(key, groupPrefix, normalizedKey, options.StrictMode);
+
+        // If already normalized to a non-identifying placeholder (e.g., "Standard Software" or "YYYY-MM"),
+        // treat post-sanitization residual risk as low benign technical metadata.
+        bool isAlreadyGeneralized = PrivacyRiskEvaluator.IsGeneralizedPlaceholderValue(normalizedKey, rawString);
+        if (isAlreadyGeneralized && !isRuntimeSynthetic)
+        {
+            priority = MetaPriority.Low;
+            reason = "Already generalized to non-identifying Tier-3 placeholder";
+        }
+
+        double baseWeight = PrivacyRiskEvaluator.AssignBaseWeight(normalizedKey, rawString, priority, category, isRuntimeSynthetic);
 
         // Apply user-provided overrides if specified
         var forceKeep = options.KeepTags.Any(t =>
@@ -208,28 +226,47 @@ public sealed class MetaCoreEngine
             t.Equals(normalizedKey, StringComparison.OrdinalIgnoreCase));
 
         MetaAction action;
+        MetaTierPolicy tierPolicy;
+        string? generalizedValue = null;
+
         if (forceRemove)
         {
             action = MetaAction.Remove;
+            tierPolicy = MetaTierPolicy.Tier1Purge;
             if (priority < MetaPriority.High)
             {
                 priority = MetaPriority.High;
+                baseWeight = Math.Max(baseWeight, 7.0);
                 reason = "Explicitly marked for removal by sanitization policy";
             }
         }
         else if (forceKeep)
         {
             action = MetaAction.Keep;
+            tierPolicy = priority == MetaPriority.Required ? MetaTierPolicy.Tier2RetainUtility : MetaTierPolicy.RetainHarmless;
             reason = "Explicitly preserved by sanitization policy";
+        }
+        else if (priority == MetaPriority.Required)
+        {
+            action = options.KeepRequired ? MetaAction.Keep : MetaAction.Remove;
+            tierPolicy = action == MetaAction.Keep ? MetaTierPolicy.Tier2RetainUtility : MetaTierPolicy.Tier1Purge;
+        }
+        else if (priority == MetaPriority.Low)
+        {
+            action = options.KeepLowPriority ? MetaAction.Keep : MetaAction.Remove;
+            tierPolicy = action == MetaAction.Keep ? MetaTierPolicy.RetainHarmless : MetaTierPolicy.Tier1Purge;
+        }
+        else if (options.EnableTier3Normalization && isEmbeddedWritable && !isRuntimeSynthetic && baseWeight is >= 4.0 and < 7.0 && !string.IsNullOrWhiteSpace(rawString))
+        {
+            action = MetaAction.Normalize;
+            tierPolicy = MetaTierPolicy.Tier3Generalize;
+            generalizedValue = PrivacyRiskEvaluator.GeneralizeValue(normalizedKey, rawString);
+            reason = $"{reason} (Tier 3 generalized to '{generalizedValue}')";
         }
         else
         {
-            action = priority switch
-            {
-                MetaPriority.Required => options.KeepRequired ? MetaAction.Keep : MetaAction.Remove,
-                MetaPriority.Low => options.KeepLowPriority ? MetaAction.Keep : MetaAction.Remove,
-                _ => MetaAction.Remove
-            };
+            action = MetaAction.Remove;
+            tierPolicy = MetaTierPolicy.Tier1Purge;
         }
 
         return new ClassifiedMetadetail
@@ -239,8 +276,11 @@ public sealed class MetaCoreEngine
             Value = value?.DeepClone(),
             Priority = priority,
             PriorityScore = ScoreForPriority(priority),
+            BaseWeight = baseWeight,
+            TierPolicy = tierPolicy,
             Category = category,
             Action = action,
+            GeneralizedValue = generalizedValue,
             IsSensitive = priority is MetaPriority.High or MetaPriority.Critical,
             IsRequired = priority == MetaPriority.Required,
             IsEmbeddedWritable = isEmbeddedWritable,
@@ -250,8 +290,8 @@ public sealed class MetaCoreEngine
     }
 
     /// <summary>
-    /// Evaluates an entire metadata dictionary, assigns priorities to every metadetail,
-    /// and returns an ordered MetaCore report + writable preservation list.
+    /// Evaluates an entire metadata dictionary, assigns priorities, non-linear PRI clusters,
+    /// and returns an ordered MetaCore report with writable preservation and normalization plans.
     /// </summary>
     public MetaCoreReport AnalyzeMetadata(JsonObject metadata, MetaSanitizeOptions? options = null)
     {
@@ -261,6 +301,32 @@ public sealed class MetaCoreEngine
         foreach (var kvp in metadata)
         {
             details.Add(ClassifyTag(kvp.Key, kvp.Value, options));
+        }
+
+        var (pri, priBand, clusters) = PrivacyRiskEvaluator.EvaluatePri(details);
+
+        // Enforce Algorithm 1 line 5: if a candidate Tier-3 field participates in an active quasi-identifier cluster K,
+        // escalate to Tier 1 Purge unless its cluster partner is already eliminated cleanly.
+        if (options.EnableTier3Normalization && clusters.Count > 0)
+        {
+            var clusterTags = clusters.SelectMany(c => c.InvolvedTags).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var d in details)
+            {
+                if (d.Action == MetaAction.Normalize && clusterTags.Contains(d.NormalizedKey))
+                {
+                    // K_device or K_geo-time member escalates to Tier 1 Purge to neutralize cluster linkage
+                    bool forceKeep = options.KeepTags.Any(t =>
+                        t.Equals(d.Key, StringComparison.OrdinalIgnoreCase) ||
+                        t.Equals(d.NormalizedKey, StringComparison.OrdinalIgnoreCase));
+                    if (!forceKeep)
+                    {
+                        d.Action = MetaAction.Remove;
+                        d.TierPolicy = MetaTierPolicy.Tier1Purge;
+                        d.GeneralizedValue = null;
+                        d.Reason = $"{d.Reason}; escalated to Tier 1 Purge due to active quasi-identifier cluster membership";
+                    }
+                }
+            }
         }
 
         // Order so the highest sensitivity / priority items surface first, followed by Low and Required.
@@ -278,6 +344,17 @@ public sealed class MetaCoreEngine
 
         var kept = details.Where(d => d.Action == MetaAction.Keep).ToList();
         var removed = details.Where(d => d.Action == MetaAction.Remove).ToList();
+        var normalized = details.Where(d => d.Action == MetaAction.Normalize).ToList();
+
+        var normalizedValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var n in normalized)
+        {
+            if (!string.IsNullOrEmpty(n.GeneralizedValue))
+            {
+                normalizedValues.TryAdd(n.NormalizedKey, n.GeneralizedValue);
+                normalizedValues.TryAdd(n.Key, n.GeneralizedValue);
+            }
+        }
 
         var writablePreserveTags = kept
             .Where(d => d.IsEmbeddedWritable && !d.IsRuntimeSynthetic)
@@ -303,10 +380,16 @@ public sealed class MetaCoreEngine
             SensitiveCount = sensitiveCount,
             KeptCount = kept.Count,
             RemovedCount = removed.Count,
+            NormalizedCount = normalized.Count,
             RiskLevel = riskLevel,
+            PrivacyRiskIndex = pri,
+            PriRiskBand = priBand,
+            RiskClusters = clusters,
             Details = details,
             KeptTags = kept.Select(d => d.Key).ToList(),
             RemovedTags = removed.Select(d => d.Key).ToList(),
+            NormalizedTags = normalized.Select(d => d.Key).ToList(),
+            NormalizedValues = normalizedValues,
             WritablePreserveTags = writablePreserveTags
         };
     }

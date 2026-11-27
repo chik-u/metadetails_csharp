@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.IO.Compression;
 using System.Text;
 using System.Text.Json.Nodes;
 using MetaDetective.Api.MetaCore;
@@ -295,6 +296,134 @@ public class MetaCoreSanitizationTests
         }
     }
 
+    [Fact]
+    public void PrivacyRiskEvaluator_ComputesCompoundPriAndClusterSynergies()
+    {
+        var metadata = new JsonObject
+        {
+            ["Orientation"] = 1,
+            ["ISO"] = 200,
+            ["GPSLatitude"] = "28.6139",
+            ["GPSLongitude"] = "77.2090",
+            ["DateTimeOriginal"] = "2026:05:10 14:20:00",
+            ["Make"] = "Canon",
+            ["SerialNumber"] = "SN-424242",
+            ["Artist"] = "Manvendra Singh"
+        };
+
+        var report = _engine.AnalyzeMetadata(metadata);
+
+        Assert.Contains(report.RiskClusters, c => c.ClusterId == "K_geo-time");
+        Assert.Contains(report.RiskClusters, c => c.ClusterId == "K_device");
+        Assert.Contains(report.RiskClusters, c => c.ClusterId == "K_identity");
+        Assert.True(report.PrivacyRiskIndex >= 50.0);
+        Assert.Equal("Critical Risk", report.PriRiskBand);
+    }
+
+    [Fact]
+    public void TamperDetectionService_DetectsAllFourHeuristicAnomalies_AndPassesConsistentFile()
+    {
+        var tamperedMeta = new JsonObject
+        {
+            ["Make"] = "Canon",
+            ["Model"] = "EOS R6",
+            ["ExposureTime"] = "1/125",
+            ["Software"] = "Adobe Photoshop CC 2025",
+            ["DateTimeOriginal"] = "2026:05:10 15:00:00",
+            ["ModifyDate"] = "2026:05:09 10:00:00", // Earlier than Create -> tau_chron
+            ["GPSLatitude"] = "40.7128" // Missing longitude -> tau_clust
+        };
+
+        var audit = TamperDetectionService.Audit(tamperedMeta);
+        Assert.True(audit.IsTampered);
+        Assert.Contains(audit.Flags, f => f.RuleId == "tau_chron");
+        Assert.Contains(audit.Flags, f => f.RuleId == "tau_soft");
+        Assert.Contains(audit.Flags, f => f.RuleId == "tau_clust");
+
+        // Solar time divergence test (tau_geo): Lon -75 => solar offset -5h; GPS UTC 17:00 => solar ~12:00, vs local 21:00 (diff 9h > 2.5h)
+        var spoofedSolarMeta = new JsonObject
+        {
+            ["GPSLatitude"] = "40.7128",
+            ["GPSLongitude"] = "-75.0",
+            ["GPSTimeStamp"] = "17:00:00",
+            ["DateTimeOriginal"] = "2026:05:10 21:00:00"
+        };
+        var solarAudit = TamperDetectionService.Audit(spoofedSolarMeta);
+        Assert.Contains(solarAudit.Flags, f => f.RuleId == "tau_geo");
+
+        // Consistent file should produce zero tamper flags
+        var cleanAudit = TamperDetectionService.Audit(new JsonObject
+        {
+            ["Make"] = "Google",
+            ["Model"] = "Pixel 9",
+            ["DateTimeOriginal"] = "2026:05:10 12:15:00",
+            ["ModifyDate"] = "2026:05:10 12:16:00",
+            ["GPSLatitude"] = "40.7128",
+            ["GPSLongitude"] = "-75.0",
+            ["GPSTimeStamp"] = "17:00:00"
+        });
+        Assert.False(cleanAudit.IsTampered);
+    }
+
+    [Fact]
+    public async Task OsMediationService_MediatesPdfOpenXmlAndMp4InVolatileMemory_PreservingUtility()
+    {
+        var mediator = new OsMediationService(_engine, new MetadataExtractorService(), new FileSanitizerService(_engine, new MetadataExtractorService()));
+
+        var inputs = new List<OsMediationInput>
+        {
+            new() { FileName = "report.pdf", ContentType = "application/pdf", Payload = BuildTestPdfWithStructTree(), SourceChannel = "android-action-send-multiple" },
+            new() { FileName = "slides.docx", ContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document", Payload = BuildTestDocxWithMetadata(), SourceChannel = "android-action-send-multiple" },
+            new() { FileName = "clip.mp4", ContentType = "video/mp4", Payload = BuildTestMp4WithMetadata(), SourceChannel = "android-action-send-multiple" },
+            new() { FileName = "shot.jpg", ContentType = "image/jpeg", Payload = BuildTestJpegWithFullMetadata(), SourceChannel = "android-action-send-multiple" }
+        };
+
+        var (batch, items) = await mediator.MediateBatchAsync(inputs, OsMediationService.CreateDefaultMediationOptions(), "android-action-send-multiple");
+
+        Assert.Equal("ACTION_SEND_MULTIPLE", batch.MediationMode);
+        Assert.True(batch.ZeroTransitVerified);
+        Assert.Empty(batch.Errors);
+        Assert.Equal(4, batch.Assets.Count);
+        Assert.All(batch.Assets, a =>
+        {
+            Assert.True(a.VolatileMemoryOnly);
+            Assert.True(a.ZeroTransitVerified);
+            Assert.Empty(a.RemainingSensitiveFields);
+            Assert.True(a.AfterPri < a.BeforePri);
+            Assert.Equal(100.0, a.Usability.CompositeUsabilityScore);
+        });
+
+        // Verify PDF/UA accessibility tree survived sanitization
+        var (pdfRes, pdfClean) = items.Single(x => x.Result.FileName == "report.pdf");
+        Assert.True(pdfRes.Usability.HadPdfAccessibilityTree);
+        Assert.True(pdfRes.Usability.PdfAccessibilityPreserved);
+        var pdfMetaAfter = NativeBinaryMetadataHandler.ExtractMetadata(pdfClean.AsMemory(), "clean.pdf");
+        Assert.False(pdfMetaAfter.ContainsKey("Author"));
+        Assert.True(pdfMetaAfter["HasStructTreeRoot"]?.GetValue<bool>());
+
+        // Verify DOCX OpenXML integrity and absence of Author / Custom properties / comments
+        var (docxRes, docxClean) = items.Single(x => x.Result.FileName == "slides.docx");
+        Assert.True(docxRes.Usability.OpenXmlIntegrityPreserved);
+        var docxMetaAfter = NativeBinaryMetadataHandler.ExtractMetadata(docxClean.AsMemory(), "clean.docx");
+        Assert.False(docxMetaAfter.ContainsKey("Author"));
+        Assert.False(docxMetaAfter.ContainsKey("Company"));
+        Assert.False(docxMetaAfter.ContainsKey("Comments"));
+        Assert.True(docxMetaAfter["OpenXMLIntegrity"]?.GetValue<bool>());
+
+        // Verify MP4 stripped GPSCoordinates & Artist while retaining tkhd rotation (90 deg) & updating stco chunk offset cleanly
+        var (_, mp4Clean) = items.Single(x => x.Result.FileName == "clip.mp4");
+        var mp4MetaAfter = NativeBinaryMetadataHandler.ExtractMetadata(mp4Clean.AsMemory(), "clean.mp4");
+        Assert.False(mp4MetaAfter.ContainsKey("GPSCoordinates"));
+        Assert.False(mp4MetaAfter.ContainsKey("Artist"));
+        Assert.Equal(90, mp4MetaAfter["Rotate"]?.GetValue<int>());
+        Assert.Contains(mp4Clean, b => b == 0xAA); // Verify mdat payload preserved
+        int stcoIdx = mp4Clean.AsSpan().IndexOf("stco"u8);
+        int mdatIdx = mp4Clean.AsSpan().IndexOf("mdat"u8);
+        Assert.True(stcoIdx > 0 && mdatIdx > stcoIdx);
+        uint updatedChunkOffset = BinaryPrimitives.ReadUInt32BigEndian(mp4Clean.AsSpan(stcoIdx + 12, 4));
+        Assert.Equal((uint)(mdatIdx + 4), updatedChunkOffset);
+    }
+
     #region Binary Fixture Builders
     private static byte[] BuildTestJpegWithFullMetadata()
     {
@@ -557,6 +686,132 @@ public class MetaCoreSanitizationTests
         ms.Write(BitConverter.GetBytes(nextOffset));
         extra.Position = 0;
         extra.CopyTo(ms);
+    }
+
+    private static byte[] BuildTestPdfWithStructTree()
+    {
+        using var ms = new MemoryStream();
+        void W(string s) => ms.Write(Encoding.Latin1.GetBytes(s));
+
+        W("%PDF-1.7\n");
+        var offsets = new Dictionary<int, long>();
+
+        offsets[1] = ms.Position;
+        W("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 4 0 R /MarkInfo << /Marked true >> >>\nendobj\n");
+
+        offsets[2] = ms.Position;
+        W("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offsets[3] = ms.Position;
+        W("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n");
+
+        offsets[4] = ms.Position;
+        W("4 0 obj\n<< /Type /StructTreeRoot >>\nendobj\n");
+
+        offsets[5] = ms.Position;
+        W("5 0 obj\n<< /Title (Confidential Draft) /Author (Manvendra Singh) /Producer (Secret PDF Tool) /CreationDate (D:20260514113000Z) >>\nendobj\n");
+
+        long xref = ms.Position;
+        W("xref\n0 6\n0000000000 65535 f \n");
+        for (int i = 1; i <= 5; i++)
+            W($"{offsets[i]:D10} 00000 n \n");
+
+        W($"trailer\n<< /Size 6 /Root 1 0 R /Info 5 0 R >>\nstartxref\n{xref}\n%%EOF\n");
+        return ms.ToArray();
+    }
+
+    private static byte[] BuildTestDocxWithMetadata()
+    {
+        using var ms = new MemoryStream();
+        using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            void Add(string name, string content)
+            {
+                var entry = zip.CreateEntry(name);
+                using var s = new StreamWriter(entry.Open(), new UTF8Encoding(false));
+                s.Write(content);
+            }
+
+            Add("[Content_Types].xml", "<?xml version=\"1.0\" encoding=\"utf-8\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>");
+            Add("_rels/.rels", "<?xml version=\"1.0\" encoding=\"utf-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>");
+            Add("word/document.xml", "<?xml version=\"1.0\" encoding=\"utf-8\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>");
+            Add("word/comments.xml", "<?xml version=\"1.0\" encoding=\"utf-8\"?><w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:comment w:id=\"1\"><w:p><w:r><w:t>Internal note</w:t></w:r></w:p></w:comment></w:comments>");
+            Add("docProps/core.xml", "<?xml version=\"1.0\" encoding=\"utf-8\"?><cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\"><dc:creator>Manish Verma</dc:creator><cp:lastModifiedBy>AdminPC</cp:lastModifiedBy><dcterms:created>2026-05-14T10:30:00Z</dcterms:created></cp:coreProperties>");
+            Add("docProps/app.xml", "<?xml version=\"1.0\" encoding=\"utf-8\"?><Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\"><Application>Microsoft Word 365</Application><Company>ABES Corp</Company><Pages>20</Pages></Properties>");
+        }
+        return ms.ToArray();
+    }
+
+    private static byte[] BuildTestMp4WithMetadata()
+    {
+        static byte[] Box(string fourcc, params byte[][] parts)
+        {
+            int len = 8 + parts.Sum(p => p.Length);
+            var buf = new byte[len];
+            BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(0, 4), (uint)len);
+            Encoding.Latin1.GetBytes(fourcc, buf.AsSpan(4, 4));
+            int p = 8;
+            foreach (var part in parts)
+            {
+                part.CopyTo(buf, p);
+                p += part.Length;
+            }
+            return buf;
+        }
+
+        // ftyp (16 bytes)
+        var ftyp = Box("ftyp", Encoding.Latin1.GetBytes("isom\0\0\x02\0"));
+
+        // mvhd (version 0, create/mod 3800000000s, timescale 1000, dur 5000)
+        var mvhdPayload = new byte[96];
+        BinaryPrimitives.WriteUInt32BigEndian(mvhdPayload.AsSpan(4, 4), 3800000000u);
+        BinaryPrimitives.WriteUInt32BigEndian(mvhdPayload.AsSpan(8, 4), 3800000000u);
+        BinaryPrimitives.WriteUInt32BigEndian(mvhdPayload.AsSpan(12, 4), 1000u);
+        BinaryPrimitives.WriteUInt32BigEndian(mvhdPayload.AsSpan(16, 4), 5000u);
+        var mvhd = Box("mvhd", mvhdPayload);
+
+        // tkhd (90 deg rotation matrix: a=0, b=1 (65536), c=-1 (-65536), d=0, width=1920, height=1080)
+        var tkhdPayload = new byte[84];
+        BinaryPrimitives.WriteInt32BigEndian(tkhdPayload.AsSpan(40, 4), 0);
+        BinaryPrimitives.WriteInt32BigEndian(tkhdPayload.AsSpan(44, 4), 65536);
+        BinaryPrimitives.WriteInt32BigEndian(tkhdPayload.AsSpan(52, 4), -65536);
+        BinaryPrimitives.WriteInt32BigEndian(tkhdPayload.AsSpan(56, 4), 0);
+        BinaryPrimitives.WriteUInt32BigEndian(tkhdPayload.AsSpan(76, 4), 1920u << 16);
+        BinaryPrimitives.WriteUInt32BigEndian(tkhdPayload.AsSpan(80, 4), 1080u << 16);
+        var tkhd = Box("tkhd", tkhdPayload);
+
+        // stco pointing initially to mdat data offset (placeholder patched once moov size is known)
+        var stcoPayload = new byte[12];
+        BinaryPrimitives.WriteUInt32BigEndian(stcoPayload.AsSpan(4, 4), 1u);
+        var stbl = Box("stbl", Box("stco", stcoPayload));
+        var trakWithoutOffset = Box("trak", tkhd, Box("mdia", Box("minf", stbl)));
+
+        // udta with ©xyz GPS and meta/ilst ©ART
+        var xyzText = "+28.6139+077.2090/";
+        var xyzPayload = new byte[4 + xyzText.Length];
+        BinaryPrimitives.WriteUInt16BigEndian(xyzPayload.AsSpan(0, 2), (ushort)xyzText.Length);
+        Encoding.UTF8.GetBytes(xyzText).CopyTo(xyzPayload, 4);
+        var xyzBox = Box("\u00a9xyz", xyzPayload);
+
+        var dataPayload = new byte[16 + "SecretCreator".Length];
+        Encoding.Latin1.GetBytes("data", dataPayload.AsSpan(4, 4));
+        Encoding.UTF8.GetBytes("SecretCreator").CopyTo(dataPayload, 16);
+        var artBox = Box("\u00a9ART", dataPayload);
+        var ilstBox = Box("ilst", artBox);
+        var metaPayload = new byte[4 + ilstBox.Length];
+        ilstBox.CopyTo(metaPayload, 4);
+        var udta = Box("udta", xyzBox, Box("meta", metaPayload));
+
+        var moov = Box("moov", mvhd, trakWithoutOffset, udta);
+        var mdat = Box("mdat", [0xAA, 0xBB, 0xCC, 0xDD]);
+
+        var combined = new byte[ftyp.Length + moov.Length + mdat.Length];
+        ftyp.CopyTo(combined, 0);
+        moov.CopyTo(combined, ftyp.Length);
+        mdat.CopyTo(combined, ftyp.Length + moov.Length);
+        int initStcoIdx = combined.AsSpan().IndexOf("stco"u8);
+        BinaryPrimitives.WriteUInt32BigEndian(combined.AsSpan(initStcoIdx + 12, 4), (uint)(ftyp.Length + moov.Length + 8));
+        return combined;
     }
     #endregion
 }

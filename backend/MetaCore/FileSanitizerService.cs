@@ -94,18 +94,17 @@ public sealed class FileSanitizerService
 
             // 2. Sanitize file selectively (keep Required + Low, strip High + Critical)
             string engineUsed;
-            if (MediaExtensions.Contains(ext) && FfmpegAvailable.Value)
+            if (ext is ".svg" or ".wav" or ".pdf" or ".docx" or ".pptx" or ".xlsx" && (!FfmpegAvailable.Value || ext is ".svg" or ".pdf" or ".docx" or ".pptx" or ".xlsx"))
+            {
+                NativeBinaryMetadataHandler.SanitizeFile(inputPath, outputPath, beforeReport, safeFileName);
+                engineUsed = $"MetaCore Native Binary Sanitizer ({ext.TrimStart('.').ToUpperInvariant()})";
+            }
+            else if (MediaExtensions.Contains(ext) && FfmpegAvailable.Value)
             {
                 await SanitizeWithFfmpegAsync(inputPath, outputPath, beforeReport);
                 engineUsed = "FFmpeg + MetaCore";
             }
-            else if (ext is ".svg" or ".wav" && (!FfmpegAvailable.Value || ext == ".svg"))
-            {
-                // ExifTool is read-only for SVG and WAV; use native selective sanitizer
-                NativeBinaryMetadataHandler.SanitizeFile(inputPath, outputPath, beforeReport, safeFileName);
-                engineUsed = $"MetaCore Native Binary Sanitizer ({ext.TrimStart('.').ToUpperInvariant()})";
-            }
-            else if (_extractor.HasExifTool)
+            else if (_extractor.HasExifTool && ext is not ".mp4" and not ".mov" and not ".m4a")
             {
                 await SanitizeWithExifToolAsync(inputPath, outputPath, beforeReport);
                 engineUsed = "ExifTool + MetaCore";
@@ -143,6 +142,13 @@ public sealed class FileSanitizerService
                 .Where(d => !d.IsRuntimeSynthetic)
                 .ToList();
 
+            var tamperAudit = TamperDetectionService.Audit(beforeMeta);
+            var per = PrivacyRiskEvaluator.CalculatePer(beforeReport.PrivacyRiskIndex, afterReport.PrivacyRiskIndex);
+            var usability = PrivacyRiskEvaluator.EvaluateUsability(safeFileName, beforeReport, afterReport);
+            var generalizedFields = beforeReport.Details
+                .Where(d => d.Action == MetaAction.Normalize && !d.IsRuntimeSynthetic)
+                .ToList();
+
             var result = new SanitizationResult
             {
                 FileName = safeFileName,
@@ -152,9 +158,13 @@ public sealed class FileSanitizerService
                 SanitizedSize = sanitizedBytes.LongLength,
                 BytesRemoved = Math.Max(0, originalSize - sanitizedBytes.LongLength),
                 EngineUsed = engineUsed,
+                PrivacyExposureReductionPercent = per,
                 BeforeReport = beforeReport,
                 AfterReport = afterReport,
+                TamperAudit = tamperAudit,
+                Usability = usability,
                 RemovedFields = removedFields,
+                GeneralizedFields = generalizedFields,
                 KeptFields = keptFields,
                 RemainingSensitiveFields = remainingSensitive
             };
@@ -242,7 +252,7 @@ public sealed class FileSanitizerService
             throw new InvalidOperationException("FFmpeg failed to produce sanitized output.");
     }
 
-    private static string InferContentType(string ext) => ext switch
+    public static string InferContentType(string ext) => ext switch
     {
         ".jpg" or ".jpeg" => "image/jpeg",
         ".png" => "image/png",
@@ -251,8 +261,13 @@ public sealed class FileSanitizerService
         ".svg" => "image/svg+xml",
         ".wav" => "audio/wav",
         ".mp3" => "audio/mpeg",
+        ".m4a" => "audio/mp4",
         ".mp4" => "video/mp4",
+        ".mov" => "video/quicktime",
         ".pdf" => "application/pdf",
+        ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         _ => "application/octet-stream"
     };
 }

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Zero-Transit Android Manifest: Intentionally omits android.permission.INTERNET
+  so Android's sandbox guarantees T_transit(F) = 0 with no outbound network access.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-sdk android:minSdkVersion="26" />
+
+  <application
+      android:allowBackup="false"
+      android:label="MetaGuard OS Mediator"
+      android:supportsRtl="true"
+      android:theme="@android:style/Theme.Material.NoActionBar">
+
+    <provider
+        android:name="com.metaguard.mediator.MetaGuardContentProvider"
+        android:authorities="com.metaguard.mediator.provider"
+        android:exported="false"
+        android:grantUriPermissions="true" />
+
+  </application>
+</manifest>

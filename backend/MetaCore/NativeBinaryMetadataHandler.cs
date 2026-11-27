@@ -20,7 +20,8 @@ public static class NativeBinaryMetadataHandler
 
     private static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".wav", ".svg"
+        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".wav", ".svg",
+        ".pdf", ".docx", ".pptx", ".xlsx", ".mp4", ".mov", ".m4a"
     };
 
     public static bool IsSupported(string filePathOrExtension)
@@ -32,10 +33,16 @@ public static class NativeBinaryMetadataHandler
     public static JsonObject ExtractMetadata(string filePath, string? originalFileName = null)
     {
         var bytes = File.ReadAllBytes(filePath);
-        var ext = Path.GetExtension(originalFileName ?? filePath).ToLowerInvariant();
+        return ExtractMetadata(bytes.AsMemory(), originalFileName ?? Path.GetFileName(filePath));
+    }
+
+    public static JsonObject ExtractMetadata(ReadOnlyMemory<byte> rawBytes, string originalFileName)
+    {
+        var bytes = rawBytes.ToArray();
+        var ext = Path.GetExtension(originalFileName).ToLowerInvariant();
         var meta = new JsonObject
         {
-            ["FileName"] = originalFileName ?? Path.GetFileName(filePath),
+            ["FileName"] = Path.GetFileName(originalFileName),
             ["FileSize"] = bytes.Length
         };
 
@@ -78,9 +85,48 @@ public static class NativeBinaryMetadataHandler
                 meta["MIMEType"] = "image/svg+xml";
                 ExtractSvg(bytes, meta);
                 break;
+            case ".pdf":
+                NativePdfHandler.ExtractMetadata(bytes, meta);
+                break;
+            case ".docx":
+            case ".pptx":
+            case ".xlsx":
+                NativeOpenXmlHandler.ExtractMetadata(bytes, meta, ext);
+                break;
+            case ".mp4":
+            case ".mov":
+            case ".m4a":
+                NativeMp4Handler.ExtractMetadata(bytes, meta, ext);
+                break;
         }
 
         return meta;
+    }
+
+    /// <summary>
+    /// Selectively removes or Tier-3 normalizes metadata in volatile memory while preserving
+    /// Required and Low-priority metadata in the returned byte array.
+    /// </summary>
+    public static byte[] SanitizeBytes(ReadOnlyMemory<byte> rawBytes, MetaCoreReport report, string originalFileName)
+    {
+        var bytes = rawBytes.ToArray();
+        var ext = Path.GetExtension(originalFileName).ToLowerInvariant();
+        var actions = BuildActionLookup(report);
+        var normalized = report.NormalizedValues;
+
+        return ext switch
+        {
+            ".jpg" or ".jpeg" => SanitizeJpeg(bytes, actions, normalized),
+            ".png" => SanitizePng(bytes, actions, normalized),
+            ".webp" => SanitizeWebp(bytes, actions, normalized),
+            ".gif" => SanitizeGif(bytes, actions),
+            ".wav" => SanitizeWav(bytes, actions),
+            ".svg" => SanitizeSvg(bytes, actions),
+            ".pdf" => NativePdfHandler.SanitizeBytes(bytes, actions, normalized),
+            ".docx" or ".pptx" or ".xlsx" => NativeOpenXmlHandler.SanitizeBytes(bytes, actions, normalized),
+            ".mp4" or ".mov" or ".m4a" => NativeMp4Handler.SanitizeBytes(bytes, actions, normalized),
+            _ => throw new NotSupportedException($"Native sanitizer does not support extension '{ext}'.")
+        };
     }
 
     /// <summary>
@@ -90,20 +136,7 @@ public static class NativeBinaryMetadataHandler
     public static void SanitizeFile(string inputPath, string outputPath, MetaCoreReport report, string? originalFileName = null)
     {
         var bytes = File.ReadAllBytes(inputPath);
-        var ext = Path.GetExtension(originalFileName ?? inputPath).ToLowerInvariant();
-        var actions = BuildActionLookup(report);
-
-        byte[] sanitized = ext switch
-        {
-            ".jpg" or ".jpeg" => SanitizeJpeg(bytes, actions),
-            ".png" => SanitizePng(bytes, actions),
-            ".webp" => SanitizeWebp(bytes, actions),
-            ".gif" => SanitizeGif(bytes, actions),
-            ".wav" => SanitizeWav(bytes, actions),
-            ".svg" => SanitizeSvg(bytes, actions),
-            _ => throw new NotSupportedException($"Native sanitizer does not support extension '{ext}'.")
-        };
-
+        var sanitized = SanitizeBytes(bytes.AsMemory(), report, originalFileName ?? inputPath);
         File.WriteAllBytes(outputPath, sanitized);
     }
 
@@ -187,7 +220,7 @@ public static class NativeBinaryMetadataHandler
         }
     }
 
-    private static byte[] SanitizeJpeg(byte[] bytes, Dictionary<string, MetaAction> actions)
+    private static byte[] SanitizeJpeg(byte[] bytes, Dictionary<string, MetaAction> actions, Dictionary<string, string>? normalizedValues = null)
     {
         if (bytes.Length < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8)
             throw new InvalidDataException("Invalid JPEG file header.");
@@ -233,7 +266,7 @@ public static class NativeBinaryMetadataHandler
             {
                 if (payload.Length > ExifHeader.Length && payload[..ExifHeader.Length].SequenceEqual(ExifHeader))
                 {
-                    var rebuiltTiff = FilterTiffExif(payload[ExifHeader.Length..].ToArray(), actions);
+                    var rebuiltTiff = FilterTiffExif(payload[ExifHeader.Length..].ToArray(), actions, normalizedValues);
                     if (rebuiltTiff != null)
                     {
                         var newPayload = new byte[ExifHeader.Length + rebuiltTiff.Length];
@@ -245,7 +278,7 @@ public static class NativeBinaryMetadataHandler
                 else if (payload.Length > XmpHeader.Length && payload[..XmpHeader.Length].SequenceEqual(XmpHeader))
                 {
                     var xmpXml = Encoding.UTF8.GetString(payload[XmpHeader.Length..]);
-                    var filteredXmp = FilterXmp(xmpXml, actions);
+                    var filteredXmp = FilterXmp(xmpXml, actions, normalizedValues);
                     if (!string.IsNullOrEmpty(filteredXmp))
                     {
                         var xmlBytes = Encoding.UTF8.GetBytes(filteredXmp);
@@ -363,7 +396,7 @@ public static class NativeBinaryMetadataHandler
         }
     }
 
-    private static byte[] SanitizePng(byte[] bytes, Dictionary<string, MetaAction> actions)
+    private static byte[] SanitizePng(byte[] bytes, Dictionary<string, MetaAction> actions, Dictionary<string, string>? normalizedValues = null)
     {
         if (bytes.Length < 8 || !bytes.AsSpan(0, 8).SequenceEqual(PngSignature))
             throw new InvalidDataException("Invalid PNG file signature.");
@@ -383,11 +416,11 @@ public static class NativeBinaryMetadataHandler
             if (type == "tIME")
             {
                 if (ShouldKeep(actions, "ModifyDate"))
-                    WritePngChunk(ms, typeBytes, data);
+                    ms.Write(bytes, pos, 12 + (int)len);
             }
             else if (type == "eXIf")
             {
-                var filtered = FilterTiffExif(data.ToArray(), actions);
+                var filtered = FilterTiffExif(data.ToArray(), actions, normalizedValues);
                 if (filtered != null)
                     WritePngChunk(ms, typeBytes, filtered);
             }
@@ -398,7 +431,7 @@ public static class NativeBinaryMetadataHandler
                 if (keyword.Equals("XML:com.adobe.xmp", StringComparison.OrdinalIgnoreCase) && type == "iTXt")
                 {
                     var xmpText = ExtractItxtPayload(data, sep);
-                    var filteredXmp = xmpText != null ? FilterXmp(xmpText, actions) : null;
+                    var filteredXmp = xmpText != null ? FilterXmp(xmpText, actions, normalizedValues) : null;
                     if (!string.IsNullOrEmpty(filteredXmp))
                     {
                         var rebuilt = BuildUncompressedItxt(keyword, filteredXmp);
@@ -407,18 +440,30 @@ public static class NativeBinaryMetadataHandler
                 }
                 else if (!string.IsNullOrEmpty(keyword) && ShouldKeep(actions, keyword))
                 {
-                    WritePngChunk(ms, typeBytes, data);
+                    ms.Write(bytes, pos, 12 + (int)len);
+                }
+                else if (!string.IsNullOrEmpty(keyword) &&
+                         actions.TryGetValue(keyword, out var act) && act == MetaAction.Normalize &&
+                         normalizedValues != null && normalizedValues.TryGetValue(keyword, out var normVal))
+                {
+                    var keyBytes = Encoding.Latin1.GetBytes(keyword);
+                    var valBytes = Encoding.Latin1.GetBytes(normVal);
+                    var textPayload = new byte[keyBytes.Length + 1 + valBytes.Length];
+                    keyBytes.CopyTo(textPayload, 0);
+                    textPayload[keyBytes.Length] = 0;
+                    valBytes.CopyTo(textPayload, keyBytes.Length + 1);
+                    WritePngChunk(ms, "tEXt"u8, textPayload);
                 }
             }
             else if (type == "iCCP")
             {
                 if (ShouldKeep(actions, "ICCProfileName", defaultKeep: true))
-                    WritePngChunk(ms, typeBytes, data);
+                    ms.Write(bytes, pos, 12 + (int)len);
             }
             else
             {
-                // Preserve IHDR, PLTE, IDAT, IEND, sRGB, gAMA, cHRM, pHYs, tRNS, bKGD, etc.
-                WritePngChunk(ms, typeBytes, data);
+                // Preserve untouched structural/pixel chunks verbatim with existing CRC-32 for O(1) IDAT pass-through
+                ms.Write(bytes, pos, 12 + (int)len);
             }
 
             pos += 12 + (int)len;
@@ -586,7 +631,7 @@ public static class NativeBinaryMetadataHandler
         }
     }
 
-    private static byte[] SanitizeWebp(byte[] bytes, Dictionary<string, MetaAction> actions)
+    private static byte[] SanitizeWebp(byte[] bytes, Dictionary<string, MetaAction> actions, Dictionary<string, string>? normalizedValues = null)
     {
         if (bytes.Length < 12 || !bytes.AsSpan(0, 4).SequenceEqual("RIFF"u8) || !bytes.AsSpan(8, 4).SequenceEqual("WEBP"u8))
             throw new InvalidDataException("Invalid WebP RIFF header.");
@@ -607,7 +652,7 @@ public static class NativeBinaryMetadataHandler
             {
                 bool hadPrefix = payload.Length > ExifHeader.Length && payload[..ExifHeader.Length].SequenceEqual(ExifHeader);
                 var tiffBytes = hadPrefix ? payload[ExifHeader.Length..].ToArray() : payload.ToArray();
-                var filtered = FilterTiffExif(tiffBytes, actions);
+                var filtered = FilterTiffExif(tiffBytes, actions, normalizedValues);
                 if (filtered != null)
                 {
                     hasExifAfter = true;
@@ -616,7 +661,7 @@ public static class NativeBinaryMetadataHandler
             }
             else if (fourcc == "XMP ")
             {
-                var filteredXmp = FilterXmp(Encoding.UTF8.GetString(payload), actions);
+                var filteredXmp = FilterXmp(Encoding.UTF8.GetString(payload), actions, normalizedValues);
                 if (!string.IsNullOrEmpty(filteredXmp))
                 {
                     hasXmpAfter = true;
@@ -1207,7 +1252,7 @@ public static class NativeBinaryMetadataHandler
             meta["ThumbnailImage"] = "(Embedded IFD1 Thumbnail)";
     }
 
-    private static byte[]? FilterTiffExif(byte[] tiff, Dictionary<string, MetaAction> actions)
+    private static byte[]? FilterTiffExif(byte[] tiff, Dictionary<string, MetaAction> actions, Dictionary<string, string>? normalizedValues = null)
     {
         if (tiff.Length < 8) return null;
         bool littleEndian = tiff[0] == (byte)'I' && tiff[1] == (byte)'I';
@@ -1221,6 +1266,20 @@ public static class NativeBinaryMetadataHandler
         var keptExif = new List<TiffEntry>();
         var keptGps = new List<TiffEntry>();
 
+        static TiffEntry MaybeNormalizeTiffEntry(TiffEntry e, string name, Dictionary<string, MetaAction> actions, Dictionary<string, string>? normalizedValues)
+        {
+            if (e.Type == 2 &&
+                actions.TryGetValue(name, out var act) &&
+                act == MetaAction.Normalize &&
+                normalizedValues != null &&
+                normalizedValues.TryGetValue(name, out var norm))
+            {
+                var b = Encoding.UTF8.GetBytes(norm + "\0");
+                return new TiffEntry(e.Tag, 2, (uint)b.Length, b);
+            }
+            return e;
+        }
+
         foreach (var entry in ifd0)
         {
             if (entry.Tag == 0x8769 && entry.RawBytes.Length >= 4)
@@ -1232,6 +1291,8 @@ public static class NativeBinaryMetadataHandler
                     var name = ExifIfdTagNames.GetValueOrDefault(e.Tag, $"ExifTag_0x{e.Tag:X4}");
                     if (ShouldKeep(actions, name))
                         keptExif.Add(e);
+                    else if (actions.TryGetValue(name, out var act) && act == MetaAction.Normalize && e.Type == 2)
+                        keptExif.Add(MaybeNormalizeTiffEntry(e, name, actions, normalizedValues));
                 }
             }
             else if (entry.Tag == 0x8825 && entry.RawBytes.Length >= 4)
@@ -1250,6 +1311,8 @@ public static class NativeBinaryMetadataHandler
                 var name = Ifd0TagNames.GetValueOrDefault(entry.Tag, $"IFD0Tag_0x{entry.Tag:X4}");
                 if (ShouldKeep(actions, name))
                     keptIfd0.Add(entry);
+                else if (actions.TryGetValue(name, out var act) && act == MetaAction.Normalize && entry.Type == 2)
+                    keptIfd0.Add(MaybeNormalizeTiffEntry(entry, name, actions, normalizedValues));
             }
         }
 
@@ -1505,7 +1568,7 @@ public static class NativeBinaryMetadataHandler
         catch { }
     }
 
-    private static string? FilterXmp(string xml, Dictionary<string, MetaAction> actions)
+    private static string? FilterXmp(string xml, Dictionary<string, MetaAction> actions, Dictionary<string, string>? normalizedValues = null)
     {
         try
         {
@@ -1520,20 +1583,38 @@ public static class NativeBinaryMetadataHandler
                 {
                     var prefix = desc.GetPrefixOfNamespace(attr.Name.Namespace);
                     var key = string.IsNullOrEmpty(prefix) ? $"XMP:{attr.Name.LocalName}" : $"XMP-{prefix}:{attr.Name.LocalName}";
-                    if (!ShouldKeep(actions, key) && !ShouldKeep(actions, attr.Name.LocalName))
-                        attr.Remove();
-                    else
+                    if (ShouldKeep(actions, key) || ShouldKeep(actions, attr.Name.LocalName))
+                    {
                         anyKept = true;
+                    }
+                    else if (TryGetNormalized(actions, normalizedValues, key, attr.Name.LocalName, out var norm))
+                    {
+                        attr.Value = norm;
+                        anyKept = true;
+                    }
+                    else
+                    {
+                        attr.Remove();
+                    }
                 }
 
                 foreach (var el in desc.Elements().ToList())
                 {
                     var prefix = desc.GetPrefixOfNamespace(el.Name.Namespace);
                     var key = string.IsNullOrEmpty(prefix) ? $"XMP:{el.Name.LocalName}" : $"XMP-{prefix}:{el.Name.LocalName}";
-                    if (!ShouldKeep(actions, key) && !ShouldKeep(actions, el.Name.LocalName))
-                        el.Remove();
-                    else
+                    if (ShouldKeep(actions, key) || ShouldKeep(actions, el.Name.LocalName))
+                    {
                         anyKept = true;
+                    }
+                    else if (TryGetNormalized(actions, normalizedValues, key, el.Name.LocalName, out var norm))
+                    {
+                        el.Value = norm;
+                        anyKept = true;
+                    }
+                    else
+                    {
+                        el.Remove();
+                    }
                 }
             }
 
@@ -1543,6 +1624,28 @@ public static class NativeBinaryMetadataHandler
         {
             return null;
         }
+    }
+
+    private static bool TryGetNormalized(
+        Dictionary<string, MetaAction> actions,
+        Dictionary<string, string>? normalizedValues,
+        string key,
+        string localName,
+        out string norm)
+    {
+        norm = string.Empty;
+        if (normalizedValues == null) return false;
+        if (actions.TryGetValue(key, out var act) && act == MetaAction.Normalize && normalizedValues.TryGetValue(key, out var nv))
+        {
+            norm = nv;
+            return true;
+        }
+        if (actions.TryGetValue(localName, out act) && act == MetaAction.Normalize && normalizedValues.TryGetValue(localName, out nv))
+        {
+            norm = nv;
+            return true;
+        }
+        return false;
     }
     #endregion
 }

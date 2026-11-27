@@ -1,6 +1,7 @@
 import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
 import Home from './Home';
 import Scan from './Scan';
+import ShareMediate from './ShareMediate';
 import History from './History';
 import Login from './Login';
 import './App.css';
@@ -13,6 +14,7 @@ function App() {
           <ul>
             <li><Link to="/">Home</Link></li>
             <li><Link to="/scan">Scan</Link></li>
+            <li><Link to="/share-mediate">OS Mediation</Link></li>
             <li><Link to="/history">History</Link></li>
             <li><Link to="/login">Login / Register</Link></li>
           </ul>
@@ -21,6 +23,7 @@ function App() {
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/scan" element={<Scan />} />
+            <Route path="/share-mediate" element={<ShareMediate />} />
             <Route path="/history" element={<History />} />
             <Route path="/login" element={<Login />} />
           </Routes>
