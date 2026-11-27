@@ -83,6 +83,7 @@ public sealed class ShareMediatorActivity : Activity
     {
         var scroll = new ScrollView(this);
         scroll.SetBackgroundColor(Color.ParseColor("#0F172A"));
+        scroll.SetFitsSystemWindows(true);
 
         var root = new LinearLayout(this)
         {
@@ -350,6 +351,10 @@ public sealed class ShareMediatorActivity : Activity
             shareIntent.PutParcelableArrayListExtra(Intent.ExtraStream, outboundUris.Cast<IParcelable>().ToList());
         }
 
+        var clip = ClipData.NewRawUri("MetaGuard Sanitized Output", outboundUris[0]);
+        for (int i = 1; i < outboundUris.Count; i++)
+            clip?.AddItem(new ClipData.Item(outboundUris[i]));
+        shareIntent.ClipData = clip;
         shareIntent.AddFlags(ActivityFlags.GrantReadUriPermission);
         var chooser = Intent.CreateChooser(shareIntent, "Dispatch Clean File (MetaGuard Safe Share)")!;
         if (OperatingSystem.IsAndroidVersionAtLeast(24))
