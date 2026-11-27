@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using MetaDetective.Api.Data;
+using MetaDetective.Api.MetaCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using System.Text;
@@ -24,6 +25,10 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 builder.Services.AddAuthorization();
+builder.Services.AddSingleton<MetaCoreEngine>();
+builder.Services.AddSingleton<MetadataExtractorService>();
+builder.Services.AddSingleton<FileSanitizerService>();
+builder.Services.AddSingleton<SanitizedFileStore>();
 
 builder.Services.AddCors(options =>
 {

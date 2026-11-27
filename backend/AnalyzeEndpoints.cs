@@ -1,18 +1,22 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using System.Diagnostics;
 using System.Text.Json;
 using System.Security.Claims;
 using MetaDetective.Api.Data;
-using System.Net.Http;
+using MetaDetective.Api.MetaCore;
 using System.Text.Json.Nodes;
 
 public static class AnalyzeEndpoints
 {
     public static void Map(WebApplication app)
     {
-        app.MapPost("/api/analyze", async (HttpRequest request, AppDbContext db, ClaimsPrincipal user) =>
+        app.MapPost("/api/analyze", async (
+            HttpRequest request,
+            AppDbContext db,
+            ClaimsPrincipal user,
+            MetadataExtractorService extractor,
+            MetaCoreEngine metaCore) =>
         {
             if (!request.HasFormContentType) return Results.BadRequest(new { error = "Expected form-data" });
 
@@ -20,75 +24,150 @@ public static class AnalyzeEndpoints
             var files = form.Files.Where(f => f.Name == "files" || f.Name == "file").ToList();
             if (files.Count == 0) return Results.BadRequest(new { error = "No file uploaded" });
 
+            var options = ParseSanitizeOptions(form);
             var results = new List<object>();
-            
+
             foreach (var file in files)
             {
-                var tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + "_" + file.FileName);
-                
-                using (var stream = new FileStream(tempPath, FileMode.Create))
+                var safeName = Path.GetFileName(file.FileName);
+                var tempPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}_{safeName}");
+
+                await using (var stream = new FileStream(tempPath, FileMode.Create))
                 {
                     await file.CopyToAsync(stream);
                 }
 
-                JsonNode? metadata = null;
+                JsonObject? metadata = null;
+                MetaCoreReport? report = null;
+                string? engine = null;
                 try
                 {
-                    var output = await RunExifToolAsync(tempPath);
-                    var jsonArray = JsonNode.Parse(output) as JsonArray;
-                    if (jsonArray != null && jsonArray.Count > 0)
-                    {
-                        metadata = jsonArray[0];
-                        if (metadata is JsonObject jsonObj)
-                        {
-                            var ext = Path.GetExtension(file.FileName).ToLower();
-                            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg")
-                            {
-                                try {
-                                    var ocr = await RunTesseractAsync(tempPath);
-                                    if (!string.IsNullOrWhiteSpace(ocr)) jsonObj["OCRText"] = ocr;
-                                } catch {}
-                            }
-                            else if (ext == ".mp4" || ext == ".avi" || ext == ".mov" || ext == ".mp3" || ext == ".wav")
-                            {
-                                try {
-                                    var ffprobe = await RunFfprobeAsync(tempPath);
-                                    if (!string.IsNullOrWhiteSpace(ffprobe)) jsonObj["FFprobe"] = JsonNode.Parse(ffprobe);
-                                } catch {}
-                            }
-                        }
-                    }
+                    var extracted = await extractor.ExtractAsync(tempPath, safeName);
+                    metadata = extracted.Metadata;
+                    engine = extracted.Engine;
+                    report = metaCore.AnalyzeMetadata(metadata, options);
                 }
                 catch (Exception ex)
                 {
-                    metadata = JsonNode.Parse($@"{{ ""Error"": {JsonSerializer.Serialize(ex.Message)} }}");
+                    metadata = new JsonObject { ["Error"] = ex.Message };
                 }
                 finally
                 {
                     if (File.Exists(tempPath)) File.Delete(tempPath);
                 }
 
-                results.Add(new {
-                    filename = file.FileName,
-                    metadata = metadata
+                results.Add(new
+                {
+                    filename = safeName,
+                    engine,
+                    metadata,
+                    metaCore = report
                 });
             }
 
-            var userIdStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-            if (Guid.TryParse(userIdStr, out var userId))
+            await TrySaveScanAsync(db, user, "file", files.Count == 1 ? Path.GetFileName(files[0].FileName) : $"{files.Count} files", results);
+            return Results.Ok(results);
+        });
+
+        app.MapPost("/api/sanitize", async (
+            HttpRequest request,
+            AppDbContext db,
+            ClaimsPrincipal user,
+            FileSanitizerService sanitizer,
+            SanitizedFileStore fileStore) =>
+        {
+            if (!request.HasFormContentType) return Results.BadRequest(new { error = "Expected form-data" });
+
+            var form = await request.ReadFormAsync();
+            var files = form.Files.Where(f => f.Name == "files" || f.Name == "file").ToList();
+            if (files.Count == 0) return Results.BadRequest(new { error = "No file uploaded" });
+
+            var options = ParseSanitizeOptions(form);
+            var results = new List<object>();
+            var errors = new List<string>();
+
+            foreach (var file in files)
             {
-                var scan = new Scan
+                var safeName = Path.GetFileName(file.FileName);
+                var tempPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}_{safeName}");
+
+                await using (var stream = new FileStream(tempPath, FileMode.Create))
                 {
-                    UserId = userId,
-                    ScanType = "file",
-                    Name = files.Count == 1 ? files[0].FileName : $"{files.Count} files",
-                    Result = JsonSerializer.SerializeToDocument(results)
-                };
-                db.Scans.Add(scan);
-                await db.SaveChangesAsync();
+                    await file.CopyToAsync(stream);
+                }
+
+                try
+                {
+                    var (result, sanitizedBytes) = await sanitizer.SanitizeFileAsync(tempPath, safeName, file.ContentType, options);
+                    var downloadId = fileStore.Save(result.SanitizedFileName, result.ContentType, sanitizedBytes);
+                    result.DownloadId = downloadId;
+                    result.DownloadUrl = $"/api/sanitize/download/{downloadId}";
+                    results.Add(result);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{safeName}: {ex.Message}");
+                    results.Add(new { fileName = safeName, error = ex.Message });
+                }
+                finally
+                {
+                    if (File.Exists(tempPath)) File.Delete(tempPath);
+                }
             }
 
+            if (errors.Count == files.Count)
+                return Results.BadRequest(new { error = string.Join("; ", errors), results });
+
+            await TrySaveScanAsync(db, user, "sanitize", files.Count == 1 ? Path.GetFileName(files[0].FileName) : $"{files.Count} files", results);
             return Results.Ok(results);
+        });
+
+        app.MapGet("/api/sanitize/download/{id}", (string id, SanitizedFileStore fileStore) =>
+        {
+            if (!fileStore.TryGet(id, out var stored) || stored == null)
+                return Results.NotFound(new { error = "Sanitized file not found or expired." });
+
+            return Results.File(stored.Content, stored.ContentType, stored.FileName);
+        });
+
+        app.MapPost("/api/sanitize/file", async (
+            HttpRequest request,
+            HttpResponse response,
+            FileSanitizerService sanitizer) =>
+        {
+            if (!request.HasFormContentType) return Results.BadRequest(new { error = "Expected form-data" });
+
+            var form = await request.ReadFormAsync();
+            var file = form.Files.FirstOrDefault(f => f.Name == "file" || f.Name == "files");
+            if (file == null) return Results.BadRequest(new { error = "No file uploaded" });
+
+            var options = ParseSanitizeOptions(form);
+            var safeName = Path.GetFileName(file.FileName);
+            var tempPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}_{safeName}");
+
+            await using (var stream = new FileStream(tempPath, FileMode.Create))
+            {
+                await file.CopyToAsync(stream);
+            }
+
+            try
+            {
+                var (result, sanitizedBytes) = await sanitizer.SanitizeFileAsync(tempPath, safeName, file.ContentType, options);
+                response.Headers["X-MetaCore-Engine"] = result.EngineUsed;
+                response.Headers["X-MetaCore-Removed-Count"] = result.RemovedFields.Count.ToString();
+                response.Headers["X-MetaCore-Kept-Count"] = result.KeptFields.Count.ToString();
+                response.Headers["X-MetaCore-Risk-Before"] = result.BeforeReport.RiskLevel;
+                response.Headers["X-MetaCore-Risk-After"] = result.AfterReport.RiskLevel;
+                return Results.File(sanitizedBytes, result.ContentType, result.SanitizedFileName);
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            finally
+            {
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+            }
         });
 
         app.MapPost("/api/scrape", async ([FromBody] ScrapeRequest req, AppDbContext db, ClaimsPrincipal user) =>
@@ -104,32 +183,24 @@ public static class AnalyzeEndpoints
                 doc.LoadHtml(html);
                 var title = doc.DocumentNode.SelectSingleNode("//title")?.InnerText ?? "No Title";
 
-                metadata = JsonNode.Parse($@"{{ ""url"": ""{req.Url}"", ""title"": ""{title}"" }}");
+                metadata = new JsonObject
+                {
+                    ["url"] = req.Url,
+                    ["title"] = title
+                };
             }
             catch (Exception ex)
             {
-                metadata = JsonNode.Parse($@"{{ ""error"": {JsonSerializer.Serialize(ex.Message)} }}");
+                metadata = new JsonObject { ["error"] = ex.Message };
             }
-            
-            results.Add(new {
+
+            results.Add(new
+            {
                 filename = req.Url,
-                metadata = metadata
+                metadata
             });
 
-            var userIdStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
-            if (Guid.TryParse(userIdStr, out var userId))
-            {
-                var scan = new Scan
-                {
-                    UserId = userId,
-                    ScanType = "url",
-                    Name = req.Url,
-                    Result = JsonSerializer.SerializeToDocument(results)
-                };
-                db.Scans.Add(scan);
-                await db.SaveChangesAsync();
-            }
-
+            await TrySaveScanAsync(db, user, "url", req.Url, results);
             return Results.Ok(results);
         });
 
@@ -138,7 +209,7 @@ public static class AnalyzeEndpoints
             using var client = new HttpClient();
             client.DefaultRequestHeaders.Add("User-Agent", "MetaDetective/1.0");
             var url = $"https://nominatim.openstreetmap.org/reverse?format=json&lat={req.Lat}&lon={req.Lon}";
-            
+
             try
             {
                 var response = await client.GetStringAsync(url);
@@ -151,44 +222,58 @@ public static class AnalyzeEndpoints
         });
     }
 
-    private static async Task<string> RunExifToolAsync(string filePath)
+    private static MetaSanitizeOptions ParseSanitizeOptions(IFormCollection form)
     {
-        var psi = new ProcessStartInfo
+        var options = new MetaSanitizeOptions();
+
+        if (bool.TryParse(form["keepRequired"], out var keepReq))
+            options.KeepRequired = keepReq;
+        if (bool.TryParse(form["keepLowPriority"], out var keepLow))
+            options.KeepLowPriority = keepLow;
+        if (bool.TryParse(form["strictMode"], out var strict))
+            options.StrictMode = strict;
+
+        options.KeepTags = ParseTagList(form["keepTags"]);
+        options.RemoveTags = ParseTagList(form["removeTags"]);
+        return options;
+    }
+
+    private static List<string> ParseTagList(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return new List<string>();
+        var trimmed = raw.Trim();
+        if (trimmed.StartsWith('['))
         {
-            FileName = "exiftool",
-            Arguments = $"-j \"{filePath}\"",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-
-        using var process = Process.Start(psi);
-        if (process == null) throw new Exception("Could not start exiftool");
-
-        var output = await process.StandardOutput.ReadToEndAsync();
-        await process.WaitForExitAsync();
-        
-        return string.IsNullOrWhiteSpace(output) ? "[]" : output;
+            try
+            {
+                return JsonSerializer.Deserialize<List<string>>(trimmed) ?? new List<string>();
+            }
+            catch { }
+        }
+        return trimmed.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
     }
 
-    private static async Task<string> RunTesseractAsync(string filePath)
+    private static async Task TrySaveScanAsync(AppDbContext db, ClaimsPrincipal user, string scanType, string name, object results)
     {
-        var psi = new ProcessStartInfo { FileName = "tesseract", Arguments = $"\"{filePath}\" stdout", RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
-        using var process = Process.Start(psi);
-        if (process == null) return "";
-        var output = await process.StandardOutput.ReadToEndAsync();
-        await process.WaitForExitAsync();
-        return output.Trim();
-    }
-    private static async Task<string> RunFfprobeAsync(string filePath)
-    {
-        var psi = new ProcessStartInfo { FileName = "ffprobe", Arguments = $"-v quiet -print_format json -show_format -show_streams \"{filePath}\"", RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
-        using var process = Process.Start(psi);
-        if (process == null) return "";
-        var output = await process.StandardOutput.ReadToEndAsync();
-        await process.WaitForExitAsync();
-        return output.Trim();
+        var userIdStr = user.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!Guid.TryParse(userIdStr, out var userId)) return;
+
+        try
+        {
+            var scan = new Scan
+            {
+                UserId = userId,
+                ScanType = scanType,
+                Name = name,
+                Result = JsonSerializer.SerializeToDocument(results)
+            };
+            db.Scans.Add(scan);
+            await db.SaveChangesAsync();
+        }
+        catch
+        {
+            // Do not fail metadata extraction/sanitization if optional scan persistence fails.
+        }
     }
 }
 
@@ -202,5 +287,3 @@ public class GeocodeRequest
     public double Lat { get; set; }
     public double Lon { get; set; }
 }
-
-
