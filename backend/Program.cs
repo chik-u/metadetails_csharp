@@ -28,6 +28,7 @@ builder.Services.AddAuthorization();
 builder.Services.AddSingleton<MetaCoreEngine>();
 builder.Services.AddSingleton<MetadataExtractorService>();
 builder.Services.AddSingleton<FileSanitizerService>();
+builder.Services.AddSingleton<OsMediationService>();
 builder.Services.AddSingleton<SanitizedFileStore>();
 
 builder.Services.AddCors(options =>

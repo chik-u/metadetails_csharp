@@ -3,7 +3,7 @@ import type { DragEvent, ChangeEvent } from 'react';
 import axios from 'axios';
 
 type MetaPriority = 'Critical' | 'High' | 'Low' | 'Required';
-type MetaAction = 'Keep' | 'Remove';
+type MetaAction = 'Keep' | 'Normalize' | 'Remove';
 
 interface ClassifiedMetadetail {
     key: string;
@@ -30,6 +30,8 @@ interface MetaCoreReport {
     keptCount: number;
     removedCount: number;
     riskLevel: 'Critical' | 'High' | 'Low' | 'Clean';
+    privacyRiskIndex?: number;
+    priRiskBand?: string;
     details: ClassifiedMetadetail[];
     keptTags: string[];
     removedTags: string[];
@@ -42,6 +44,7 @@ interface FileResult {
     engine?: string;
     metadata?: Record<string, any>;
     metaCore?: MetaCoreReport;
+    tamperAudit?: { isTampered: boolean; flaggedRulesCount: number; flags: Array<{ ruleName: string; evidence: string }> };
     gps?: { latitude?: any; longitude?: any; GPSLatitude?: any; GPSLongitude?: any };
 }
 
@@ -55,6 +58,7 @@ interface SanitizationResult {
     engineUsed: string;
     downloadId: string;
     downloadUrl: string;
+    privacyExposureReductionPercent?: number;
     beforeReport: MetaCoreReport;
     afterReport: MetaCoreReport;
     removedFields: ClassifiedMetadetail[];
@@ -352,6 +356,12 @@ const Scan = () => {
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
                                         <strong>{r.filename || r.name || `File ${idx + 1}`}</strong>
                                         <span className={riskBadgeClass(mc.riskLevel)}>Risk: {mc.riskLevel}</span>
+                                        {typeof mc.privacyRiskIndex === 'number' && (
+                                            <span className="badge badge-default">PRI: {mc.privacyRiskIndex.toFixed(1)} ({mc.priRiskBand})</span>
+                                        )}
+                                        {r.tamperAudit?.isTampered && (
+                                            <span className="badge badge-high">Tamper Alert ({r.tamperAudit.flaggedRulesCount})</span>
+                                        )}
                                         {r.engine && <span className="badge badge-default">{r.engine}</span>}
                                     </div>
                                 </div>
